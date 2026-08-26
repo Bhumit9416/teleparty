@@ -297,29 +297,53 @@ button {
 
 .room__watch {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 6px 280px;
+  grid-template-columns: minmax(0, 1fr) 8px 280px;
   min-height: 0;
   height: 100%;
 }
 
 .room__stage {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 0.65rem;
   padding: 0.85rem clamp(0.85rem, 2vw, 1.35rem);
   min-width: 0;
   min-height: 0;
+  height: 100%;
 }
 
 .room--cinema .room__stage {
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  gap: 0.4rem;
-  padding: 0.45rem 0.55rem 0.55rem;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 0.35rem;
+  padding: 0.4rem 0.45rem 0.45rem;
+}
+
+.room__stage-body {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.room--cinema .room__stage-body {
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+}
+
+.room__stage-body .stage {
+  min-height: 0;
+  height: 100%;
+}
+
+.room--cinema .room__stage-body .stage {
+  border-radius: 0.4rem;
 }
 
 .room__side {
   display: grid;
-  grid-template-rows: minmax(0, 0.42fr) 6px minmax(0, 0.58fr);
+  grid-template-rows: minmax(0, 0.42fr) 8px minmax(0, 0.58fr);
   min-height: 0;
   min-width: 0;
   border-left: 0;
@@ -458,20 +482,30 @@ button {
   background: #000;
 }
 
-.room--cinema .room__reactions {
-  justify-content: center;
-}
-
-.room--cinema .room__reactions button {
-  width: 2.25rem;
-  height: 2.25rem;
-  font-size: 1.05rem;
-}
-
 .room__reactions {
   display: flex;
   flex-wrap: wrap;
   gap: 0.35rem;
+}
+
+.room--cinema .room__reactions {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0.65rem;
+  z-index: 4;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.room--cinema .room__reactions button {
+  pointer-events: auto;
+  width: 2.35rem;
+  height: 2.35rem;
+  font-size: 1.05rem;
+  background: rgba(12, 11, 10, 0.72);
+  backdrop-filter: blur(8px);
+  border-color: rgba(243, 235, 225, 0.16);
 }
 
 .room__reactions button {

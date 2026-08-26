@@ -244,21 +244,23 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
             )}
             {cinema && screen.error && <p className="call__error">{screen.error}</p>}
 
-            <VideoStage
-              playback={room.playback}
-              screenStream={screen.stageStream}
-              onLocalChange={emitPlayback}
-              syncToken={`${room.playback.updatedAt}-${room.playback.playing}-${room.playback.videoUrl}`}
-              sharerName={sharer?.name}
-              isLocalShare={room.playback.screenSharerId === you.id}
-            />
+            <div className="room__stage-body">
+              <VideoStage
+                playback={room.playback}
+                screenStream={screen.stageStream}
+                onLocalChange={emitPlayback}
+                syncToken={`${room.playback.updatedAt}-${room.playback.playing}-${room.playback.videoUrl}`}
+                sharerName={sharer?.name}
+                isLocalShare={room.playback.screenSharerId === you.id}
+              />
 
-            <div className="room__reactions" role="toolbar" aria-label="Reactions">
-              {REACTIONS.map((emoji) => (
-                <button key={emoji} type="button" onClick={() => sendReaction(emoji)}>
-                  {emoji}
-                </button>
-              ))}
+              <div className="room__reactions" role="toolbar" aria-label="Reactions">
+                {REACTIONS.map((emoji) => (
+                  <button key={emoji} type="button" onClick={() => sendReaction(emoji)}>
+                    {emoji}
+                  </button>
+                ))}
+              </div>
             </div>
           </section>
 

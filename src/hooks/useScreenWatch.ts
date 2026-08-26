@@ -18,11 +18,12 @@ async function tuneOutgoing(pc: RTCPeerConnection) {
     if (!params.encodings?.length) params.encodings = [{}];
 
     if (sender.track.kind === "video") {
-      params.encodings[0].maxBitrate = 1_800_000;
-      params.encodings[0].maxFramerate = 24;
-      params.degradationPreference = "maintain-framerate";
+      params.encodings[0].maxBitrate = 5_500_000;
+      params.encodings[0].maxFramerate = 30;
+      params.encodings[0].scaleResolutionDownBy = 1;
+      params.degradationPreference = "maintain-resolution";
     } else if (sender.track.kind === "audio") {
-      params.encodings[0].maxBitrate = 128_000;
+      params.encodings[0].maxBitrate = 256_000;
     }
 
     try {
@@ -41,15 +42,19 @@ async function prepareScreenStream(screen: MediaStream) {
     video.contentHint = "motion";
     try {
       await video.applyConstraints({
-        width: { ideal: 1280, max: 1280 },
-        height: { ideal: 720, max: 720 },
-        frameRate: { ideal: 24, max: 24 },
+        width: { ideal: 1920, max: 1920 },
+        height: { ideal: 1080, max: 1080 },
+        frameRate: { ideal: 30, max: 30 },
       });
     } catch {
       try {
-        await video.applyConstraints({ frameRate: { max: 24 } });
+        await video.applyConstraints({
+          width: { ideal: 1600, max: 1920 },
+          height: { ideal: 900, max: 1080 },
+          frameRate: { ideal: 30, max: 30 },
+        });
       } catch {
-        /* keep defaults */
+        /* keep capture defaults */
       }
     }
   }
@@ -234,9 +239,9 @@ export function useScreenWatch({
       try {
         screen = await navigator.mediaDevices.getDisplayMedia({
           video: {
-            frameRate: { ideal: 24, max: 24 },
-            width: { ideal: 1280, max: 1280 },
-            height: { ideal: 720, max: 720 },
+            frameRate: { ideal: 30, max: 30 },
+            width: { ideal: 1920, max: 1920 },
+            height: { ideal: 1080, max: 1080 },
           },
           audio: {
             channelCount: 2,
@@ -250,9 +255,9 @@ export function useScreenWatch({
         try {
           screen = await navigator.mediaDevices.getDisplayMedia({
             video: {
-              frameRate: { ideal: 24, max: 24 },
-              width: { ideal: 1280, max: 1280 },
-              height: { ideal: 720, max: 720 },
+              frameRate: { ideal: 30, max: 30 },
+              width: { ideal: 1920, max: 1920 },
+              height: { ideal: 1080, max: 1080 },
             },
             audio: true,
           });
