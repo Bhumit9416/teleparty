@@ -1,16 +1,15 @@
 # Teleparty
 
-Watch videos together with synced playback, live chat, and floating reactions.
+Watch videos together with synced playback, live screen share, cameras, chat, and reactions.
 
-## What this is
+## Links
 
-A local watch-party app for **videos you own or have the right to share** (direct `.mp4` / `.webm` URLs). Create a room, invite someone with the code, load a video link, and stay in sync.
+- **GitHub:** https://github.com/Bhumit9416/teleparty
+- **Vercel (UI):** https://teleparty-virid.vercel.app
 
-## What this is not
+> Rooms, chat, cams, and screen share need a always-on Node server (WebSockets). Vercel hosts the UI; for a **fully working** public app, deploy the same repo on [Render](https://render.com/deploy?repo=https://github.com/Bhumit9416/teleparty) (free web service), then either use that URL directly or set `VITE_SOCKET_URL` on Vercel to your Render URL and redeploy.
 
-This does **not** stream Netflix, Disney+, or other DRM-protected services, and it does **not** bypass black-screen / screen-capture protections. Those protections are intentional and circumventing them is illegal.
-
-## Run locally
+## Local
 
 ```bash
 npm install
