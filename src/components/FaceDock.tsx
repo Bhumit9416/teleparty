@@ -32,7 +32,12 @@ function FaceTile({
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    el.srcObject = stream;
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+    }
+    if (stream) {
+      el.play().catch(() => {});
+    }
   }, [stream]);
 
   return (

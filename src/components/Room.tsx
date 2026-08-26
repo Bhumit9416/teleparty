@@ -10,6 +10,7 @@ import type {
 import { REACTIONS } from "../types";
 import { useFaceChat } from "../hooks/useFaceChat";
 import { useScreenWatch } from "../hooks/useScreenWatch";
+import { usePanelLayout } from "../hooks/usePanelLayout";
 import { VideoStage } from "./VideoStage";
 import { ChatPanel } from "./ChatPanel";
 import { ReactionBurst } from "./ReactionBurst";
@@ -45,6 +46,8 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
     youId: you.id,
     members: room.members,
   });
+
+  const layout = usePanelLayout();
 
   useEffect(() => {
     setPicker(room.playback.mode === "screen" ? "screen" : "link");
@@ -149,7 +152,12 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
       )}
 
       <main className="room__main">
-        <div className="room__watch">
+        <div
+          className="room__watch"
+          style={{
+            gridTemplateColumns: `minmax(0, 1fr) 8px ${layout.sideWidth}px`,
+          }}
+        >
           <section className="room__stage">
             {!cinema && (
               <>
@@ -252,7 +260,20 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
             </div>
           </section>
 
-          <aside className="room__side">
+          <div
+            className="resize-handle resize-handle--col"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize main stage and side panel"
+            onPointerDown={layout.startSideDrag}
+          />
+
+          <aside
+            className="room__side"
+            style={{
+              gridTemplateRows: `minmax(0, ${layout.facesRatio}fr) 8px minmax(0, ${1 - layout.facesRatio}fr)`,
+            }}
+          >
             <FaceDock
               localStream={faces.localStream}
               remotes={faces.remotes}
@@ -264,6 +285,13 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
               onStop={() => void faces.stopCamera()}
               onToggleCam={() => void faces.toggleCam()}
               onToggleMic={faces.toggleMic}
+            />
+            <div
+              className="resize-handle resize-handle--row"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Resize cameras and chat"
+              onPointerDown={layout.startFacesDrag}
             />
             <ChatPanel messages={room.messages} youId={you.id} onSend={sendChat} />
           </aside>

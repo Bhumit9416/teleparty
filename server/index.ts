@@ -191,6 +191,23 @@ io.on("connection", (socket) => {
     emitWatch(room);
   });
 
+  /** Late joiner asks the current sharer to re-send the WebRTC offer. */
+  socket.on("request-screen", () => {
+    if (!joinedCode) return;
+    const room = rooms.get(joinedCode);
+    if (!room?.playback.screenSharerId) return;
+    if (room.playback.screenSharerId === socket.id) return;
+    io.to(room.playback.screenSharerId).emit("request-screen", { from: socket.id });
+  });
+
+  /** Tell peers with cameras to offer toward this socket. */
+  socket.on("cam-ready", () => {
+    if (!joinedCode) return;
+    const room = rooms.get(joinedCode);
+    if (!room) return;
+    socket.to(joinedCode).emit("cam-ready", { from: socket.id });
+  });
+
   socket.on(
     "playback",
     ({

@@ -77,10 +77,20 @@ export function VideoStage({
   useEffect(() => {
     const el = screenRef.current;
     if (!el) return;
-    el.srcObject = screenStream;
-    if (screenStream) {
-      el.play().catch(() => {});
+
+    if (el.srcObject !== screenStream) {
+      el.srcObject = screenStream;
     }
+
+    if (!screenStream) return;
+
+    const tryPlay = () => {
+      el.play().catch(() => {});
+    };
+
+    tryPlay();
+    el.addEventListener("loadedmetadata", tryPlay);
+    return () => el.removeEventListener("loadedmetadata", tryPlay);
   }, [screenStream]);
 
   if (playback.mode === "screen") {

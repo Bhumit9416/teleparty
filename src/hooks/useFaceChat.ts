@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
 import type { Member } from "../types";
-
-const ICE: RTCConfiguration = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-};
+import { ICE, addIce, flushIce, type IceQueue } from "../lib/rtc";
 
 export type FacePeer = {
   id: string;
@@ -29,14 +26,22 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const localRef = useRef<MediaStream | null>(null);
+  const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const iceQueueRef = useRef<IceQueue>(new Map());
   const membersRef = useRef(members);
+  const youRef = useRef(youId);
 
   useEffect(() => {
     membersRef.current = members;
   }, [members]);
 
+  useEffect(() => {
+    youRef.current = youId;
+  }, [youId]);
+
   const upsertRemote = useCallback((id: string, stream: MediaStream) => {
     const member = membersRef.current.find((m) => m.id === id);
+    remoteStreamsRef.current.set(id, stream);
     setRemotes((list) => [
       ...list.filter((r) => r.id !== id),
       {
@@ -49,6 +54,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
   }, []);
 
   const removeRemote = useCallback((id: string) => {
+    remoteStreamsRef.current.delete(id);
     setRemotes((list) => list.filter((r) => r.id !== id));
   }, []);
 
@@ -67,7 +73,13 @@ export function useFaceChat({ socket, youId, members }: Options) {
   const ensurePeer = useCallback(
     (peerId: string) => {
       let pc = peersRef.current.get(peerId);
-      if (pc) return pc;
+      if (pc && pc.connectionState !== "failed" && pc.connectionState !== "closed") {
+        return pc;
+      }
+      if (pc) {
+        pc.close();
+        peersRef.current.delete(peerId);
+      }
 
       pc = new RTCPeerConnection(ICE);
       peersRef.current.set(peerId, pc);
@@ -85,7 +97,14 @@ export function useFaceChat({ socket, youId, members }: Options) {
       };
 
       pc.ontrack = (ev) => {
-        upsertRemote(peerId, ev.streams[0] || new MediaStream([ev.track]));
+        let stream = remoteStreamsRef.current.get(peerId);
+        if (ev.streams[0]) {
+          stream = ev.streams[0];
+        } else {
+          stream = stream ?? new MediaStream();
+          if (!stream.getTrackById(ev.track.id)) stream.addTrack(ev.track);
+        }
+        upsertRemote(peerId, stream);
       };
 
       pc.onconnectionstatechange = () => {
@@ -103,14 +122,35 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
   const offerTo = useCallback(
     async (peerId: string) => {
+      if (peerId === youRef.current) return;
+      // Only the peer with the lower id initiates when both may offer (reduces glare).
+      // But if only we have media, we must offer.
       const pc = ensurePeer(peerId);
       if (localRef.current) await syncSenders(pc, localRef.current);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit("cam-offer", { to: peerId, sdp: offer });
+
+      if (pc.signalingState !== "stable") return;
+
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit("cam-offer", { to: peerId, sdp: pc.localDescription || offer });
+      } catch {
+        /* ignore */
+      }
     },
     [ensurePeer, socket, syncSenders],
   );
+
+  const connectAll = useCallback(async () => {
+    for (const m of membersRef.current) {
+      if (m.id === youRef.current) continue;
+      // Lower id offers toward higher id to avoid glare; media holder always offers if other has no pc.
+      const shouldOffer =
+        !!localRef.current &&
+        (youRef.current < m.id || !peersRef.current.has(m.id));
+      if (shouldOffer) await offerTo(m.id);
+    }
+  }, [offerTo]);
 
   const publish = useCallback(
     async (stream: MediaStream | null) => {
@@ -119,26 +159,16 @@ export function useFaceChat({ socket, youId, members }: Options) {
       setCamOn(!!stream?.getVideoTracks().some((t) => t.enabled && t.readyState === "live"));
       setMicOn(!!stream?.getAudioTracks().some((t) => t.enabled && t.readyState === "live"));
 
-      for (const m of membersRef.current) {
-        if (m.id === youId) continue;
-        if (!peersRef.current.has(m.id)) {
-          if (stream) await offerTo(m.id);
-          continue;
-        }
-        const pc = peersRef.current.get(m.id)!;
-        await syncSenders(pc, stream);
-        if (stream && pc.signalingState === "stable") {
-          try {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            socket.emit("cam-offer", { to: m.id, sdp: offer });
-          } catch {
-            /* ignore */
-          }
+      if (stream) {
+        socket.emit("cam-ready");
+        await connectAll();
+      } else {
+        for (const pc of peersRef.current.values()) {
+          await syncSenders(pc, null);
         }
       }
     },
-    [offerTo, socket, syncSenders, youId],
+    [connectAll, socket, syncSenders],
   );
 
   const startCamera = useCallback(async () => {
@@ -187,16 +217,34 @@ export function useFaceChat({ socket, youId, members }: Options) {
     setCamOn(next);
   }, [startCamera]);
 
+  // When people join/leave, reconnect cameras.
+  useEffect(() => {
+    if (!localRef.current) return;
+    const t = window.setTimeout(() => void connectAll(), 350);
+    return () => window.clearTimeout(t);
+  }, [members, connectAll]);
+
   useEffect(() => {
     const onJoined = (member: Member) => {
       if (member.id === youId) return;
-      if (localRef.current) void offerTo(member.id);
+      if (localRef.current) {
+        window.setTimeout(() => void offerTo(member.id), 350);
+      }
     };
 
     const onLeft = (id: string) => {
       peersRef.current.get(id)?.close();
       peersRef.current.delete(id);
+      iceQueueRef.current.delete(id);
       removeRemote(id);
+    };
+
+    const onReady = ({ from }: { from: string }) => {
+      if (from === youId) return;
+      // Peer announced a camera — offer if we also have one, or just be ready to answer.
+      if (localRef.current) {
+        window.setTimeout(() => void offerTo(from), 200);
+      }
     };
 
     const onOffer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
@@ -204,20 +252,25 @@ export function useFaceChat({ socket, youId, members }: Options) {
       const polite = youId > from;
       if (pc.signalingState !== "stable") {
         if (!polite) return;
-        await pc.setLocalDescription({ type: "rollback" });
+        try {
+          await pc.setLocalDescription({ type: "rollback" });
+        } catch {
+          /* ignore */
+        }
       }
       await pc.setRemoteDescription(sdp);
+      await flushIce(pc, from, iceQueueRef.current);
       if (localRef.current) await syncSenders(pc, localRef.current);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      socket.emit("cam-answer", { to: from, sdp: answer });
+      socket.emit("cam-answer", { to: from, sdp: pc.localDescription || answer });
     };
 
     const onAnswer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
-      const pc = peersRef.current.get(from) || ensurePeer(from);
-      if (pc.signalingState === "have-local-offer") {
-        await pc.setRemoteDescription(sdp);
-      }
+      const pc = peersRef.current.get(from);
+      if (!pc || pc.signalingState !== "have-local-offer") return;
+      await pc.setRemoteDescription(sdp);
+      await flushIce(pc, from, iceQueueRef.current);
     };
 
     const onIce = async ({
@@ -228,15 +281,12 @@ export function useFaceChat({ socket, youId, members }: Options) {
       candidate: RTCIceCandidateInit;
     }) => {
       const pc = peersRef.current.get(from) || ensurePeer(from);
-      try {
-        await pc.addIceCandidate(candidate);
-      } catch {
-        /* ignore */
-      }
+      await addIce(pc, from, candidate, iceQueueRef.current);
     };
 
     socket.on("member-joined", onJoined);
     socket.on("member-left", onLeft);
+    socket.on("cam-ready", onReady);
     socket.on("cam-offer", onOffer);
     socket.on("cam-answer", onAnswer);
     socket.on("cam-ice", onIce);
@@ -244,6 +294,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
     return () => {
       socket.off("member-joined", onJoined);
       socket.off("member-left", onLeft);
+      socket.off("cam-ready", onReady);
       socket.off("cam-offer", onOffer);
       socket.off("cam-answer", onAnswer);
       socket.off("cam-ice", onIce);
