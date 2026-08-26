@@ -16,7 +16,13 @@ export default function App() {
   const [connecting, setConnecting] = useState(false);
 
   useEffect(() => {
-    const s = io(SOCKET_URL, { autoConnect: true });
+    const s = io(SOCKET_URL, {
+      autoConnect: true,
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: 12,
+      reconnectionDelay: 800,
+    });
     setSocket(s);
     return () => {
       s.disconnect();

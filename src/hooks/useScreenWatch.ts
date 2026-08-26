@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
 import type { Member } from "../types";
-import { ICE, addIce, flushIce, type IceQueue } from "../lib/rtc";
+import { ICE, addIce, flushIce, isPcDead, type IceQueue } from "../lib/rtc";
 
 type Options = {
   socket: Socket;
@@ -18,11 +18,11 @@ async function tuneOutgoing(pc: RTCPeerConnection) {
     if (!params.encodings?.length) params.encodings = [{}];
 
     if (sender.track.kind === "video") {
-      params.encodings[0].maxBitrate = 2_000_000;
+      params.encodings[0].maxBitrate = 1_800_000;
       params.encodings[0].maxFramerate = 24;
       params.degradationPreference = "maintain-framerate";
     } else if (sender.track.kind === "audio") {
-      params.encodings[0].maxBitrate = 160_000;
+      params.encodings[0].maxBitrate = 128_000;
     }
 
     try {
@@ -69,8 +69,10 @@ export function useScreenWatch({
   const [localScreen, setLocalScreen] = useState<MediaStream | null>(null);
   const [remoteScreen, setRemoteScreen] = useState<MediaStream | null>(null);
   const [error, setError] = useState("");
+  const [linkState, setLinkState] = useState("");
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const makingOfferRef = useRef<Set<string>>(new Set());
   const screenRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const iceQueueRef = useRef<IceQueue>(new Map());
@@ -94,6 +96,7 @@ export function useScreenWatch({
     peersRef.current.get(id)?.close();
     peersRef.current.delete(id);
     iceQueueRef.current.delete(id);
+    makingOfferRef.current.delete(id);
   }, []);
 
   const closeAll = useCallback(() => {
@@ -103,9 +106,7 @@ export function useScreenWatch({
   const ensurePeer = useCallback(
     (peerId: string, asSharer: boolean) => {
       let pc = peersRef.current.get(peerId);
-      if (pc && pc.connectionState !== "failed" && pc.connectionState !== "closed") {
-        return pc;
-      }
+      if (pc && !isPcDead(pc)) return pc;
       if (pc) {
         pc.close();
         peersRef.current.delete(peerId);
@@ -128,31 +129,39 @@ export function useScreenWatch({
       };
 
       pc.ontrack = (ev) => {
-        if (youRef.current && sharerRef.current === youRef.current) return;
+        if (sharerRef.current === youRef.current) return;
 
-        let stream = ev.streams[0];
+        let stream = remoteStreamRef.current;
         if (!stream) {
-          stream = remoteStreamRef.current ?? new MediaStream();
-          if (!stream.getTrackById(ev.track.id)) stream.addTrack(ev.track);
-        } else {
-          // Merge later tracks into the same stream identity for React.
-          if (remoteStreamRef.current && remoteStreamRef.current !== stream) {
-            for (const t of stream.getTracks()) {
-              if (!remoteStreamRef.current.getTrackById(t.id)) {
-                remoteStreamRef.current.addTrack(t);
-              }
-            }
-            stream = remoteStreamRef.current;
-          }
+          stream = ev.streams[0] ? ev.streams[0] : new MediaStream();
+          remoteStreamRef.current = stream;
         }
-        remoteStreamRef.current = stream;
-        setRemoteScreen(stream);
+        if (!stream.getTrackById(ev.track.id)) {
+          stream.addTrack(ev.track);
+        }
+        // New MediaStream reference so React refreshes the <video>.
+        const next = new MediaStream(stream.getTracks());
+        remoteStreamRef.current = next;
+        setRemoteScreen(next);
+        setLinkState("Screen connected");
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        const state = pc.connectionState;
+        if (state === "connecting") setLinkState("Connecting screen…");
+        if (state === "connected") setLinkState("Screen connected");
+        if (state === "failed") {
+          setLinkState("Screen connection failed — retrying…");
           closePeer(peerId);
+          if (sharerRef.current === youRef.current && screenRef.current) {
+            window.setTimeout(() => {
+              void offerToRef.current(peerId);
+            }, 600);
+          } else if (sharerRef.current && sharerRef.current !== youRef.current) {
+            socket.emit("request-screen");
+          }
         }
+        if (state === "closed") closePeer(peerId);
       };
 
       return pc;
@@ -160,35 +169,66 @@ export function useScreenWatch({
     [closePeer, socket],
   );
 
+  const offerToRef = useRef<(peerId: string) => Promise<void>>(async () => {});
+
   const offerTo = useCallback(
     async (peerId: string) => {
-      if (!screenRef.current) return;
+      if (!screenRef.current || peerId === youRef.current) return;
+      if (makingOfferRef.current.has(peerId)) return;
 
-      // Always rebuild offer path for that peer so late joiners get media.
-      closePeer(peerId);
-      const pc = ensurePeer(peerId, true);
-      await tuneOutgoing(pc);
+      let pc = peersRef.current.get(peerId);
+      if (pc && (pc.connectionState === "connected" || pc.connectionState === "connecting")) {
+        return;
+      }
+      if (pc && pc.signalingState !== "stable") return;
 
+      if (isPcDead(pc)) {
+        if (pc) closePeer(peerId);
+        pc = ensurePeer(peerId, true);
+      } else if (!pc) {
+        pc = ensurePeer(peerId, true);
+      } else {
+        // Re-attach tracks if needed
+        const senders = pc.getSenders();
+        for (const track of screenRef.current.getTracks()) {
+          const has = senders.some((s) => s.track?.id === track.id);
+          if (!has) pc.addTrack(track, screenRef.current);
+        }
+      }
+
+      makingOfferRef.current.add(peerId);
       try {
+        await tuneOutgoing(pc);
         const offer = await pc.createOffer();
+        if (pc.signalingState !== "stable") return;
         await pc.setLocalDescription(offer);
-        socket.emit("webrtc-offer", { to: peerId, sdp: pc.localDescription || offer });
+        socket.emit("webrtc-offer", { to: peerId, sdp: pc.localDescription });
+        setLinkState("Sending screen…");
       } catch {
         /* ignore glare */
+      } finally {
+        makingOfferRef.current.delete(peerId);
       }
     },
     [closePeer, ensurePeer, socket],
   );
 
-  const broadcastScreen = useCallback(async () => {
+  useEffect(() => {
+    offerToRef.current = offerTo;
+  }, [offerTo]);
+
+  const ensureOffersToMembers = useCallback(() => {
+    if (sharerRef.current !== youRef.current || !screenRef.current) return;
     for (const m of membersRef.current) {
       if (m.id === youRef.current) continue;
-      await offerTo(m.id);
+      const pc = peersRef.current.get(m.id);
+      if (!pc || isPcDead(pc)) void offerTo(m.id);
     }
   }, [offerTo]);
 
   const startShare = useCallback(async () => {
     setError("");
+    setLinkState("");
     try {
       let screen: MediaStream;
       try {
@@ -239,21 +279,21 @@ export function useScreenWatch({
       remoteStreamRef.current = null;
       closeAll();
       socket.emit("start-screen");
-      // Give viewers a moment to apply playback mode before offers arrive.
-      window.setTimeout(() => {
-        void broadcastScreen();
-      }, 250);
+
+      window.setTimeout(() => ensureOffersToMembers(), 400);
+      window.setTimeout(() => ensureOffersToMembers(), 1200);
 
       screen.getVideoTracks()[0].onended = () => {
         screenRef.current = null;
         setLocalScreen(null);
         closeAll();
         socket.emit("stop-screen");
+        setLinkState("");
       };
     } catch {
       setError("Screen share cancelled or unavailable.");
     }
-  }, [broadcastScreen, closeAll, socket]);
+  }, [closeAll, ensureOffersToMembers, socket]);
 
   const stopShare = useCallback(() => {
     screenRef.current?.getTracks().forEach((t) => t.stop());
@@ -261,36 +301,39 @@ export function useScreenWatch({
     setLocalScreen(null);
     closeAll();
     socket.emit("stop-screen");
+    setLinkState("");
   }, [closeAll, socket]);
 
-  // Sharer: push to everyone when member list changes.
+  // Sharer: only offer to peers that aren't connected yet (don't tear down live links).
   useEffect(() => {
     if (!active || screenSharerId !== youId) return;
     if (!screenRef.current) return;
-    void broadcastScreen();
-  }, [active, members, screenSharerId, youId, broadcastScreen]);
+    ensureOffersToMembers();
+  }, [active, members, screenSharerId, youId, ensureOffersToMembers]);
 
-  // Viewer: ask sharer for a fresh offer if we joined mid-share / missed the first offer.
+  // Viewer: keep requesting until we actually have remote tracks.
   useEffect(() => {
     if (!active || !screenSharerId || screenSharerId === youId) return;
-    if (remoteScreen) return;
+    if (remoteScreen?.getVideoTracks().length) return;
 
+    setLinkState("Waiting for screen…");
     socket.emit("request-screen");
-    const t1 = window.setTimeout(() => socket.emit("request-screen"), 800);
-    const t2 = window.setTimeout(() => socket.emit("request-screen"), 2000);
-    return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
-    };
+    const timers = [600, 1500, 3000, 5000].map((ms) =>
+      window.setTimeout(() => {
+        if (!remoteStreamRef.current?.getVideoTracks().length) {
+          socket.emit("request-screen");
+        }
+      }, ms),
+    );
+    return () => timers.forEach((t) => window.clearTimeout(t));
   }, [active, screenSharerId, youId, remoteScreen, socket, members.length]);
 
   useEffect(() => {
-    if (!active) {
-      if (screenSharerId !== youId) {
-        setRemoteScreen(null);
-        remoteStreamRef.current = null;
-        closeAll();
-      }
+    if (!active && screenSharerId !== youId) {
+      setRemoteScreen(null);
+      remoteStreamRef.current = null;
+      closeAll();
+      setLinkState("");
     }
   }, [active, screenSharerId, youId, closeAll]);
 
@@ -298,7 +341,8 @@ export function useScreenWatch({
     const onJoined = (member: Member) => {
       if (member.id === youId) return;
       if (sharerRef.current === youId && screenRef.current) {
-        window.setTimeout(() => void offerTo(member.id), 300);
+        window.setTimeout(() => void offerTo(member.id), 400);
+        window.setTimeout(() => void offerTo(member.id), 1400);
       }
     };
 
@@ -307,6 +351,7 @@ export function useScreenWatch({
       if (sharerRef.current === id) {
         setRemoteScreen(null);
         remoteStreamRef.current = null;
+        setLinkState("");
       }
     };
 
@@ -316,26 +361,45 @@ export function useScreenWatch({
     };
 
     const onOffer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
-      // Don't drop offers if playback state is slightly late — treat sender as sharer.
       if (from === youId) return;
       sharerRef.current = from;
 
-      closePeer(from);
-      const pc = ensurePeer(from, false);
-      await pc.setRemoteDescription(sdp);
-      await flushIce(pc, from, iceQueueRef.current);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit("webrtc-answer", { to: from, sdp: pc.localDescription || answer });
+      let pc = peersRef.current.get(from);
+      if (isPcDead(pc)) {
+        if (pc) closePeer(from);
+        pc = ensurePeer(from, false);
+      } else if (!pc) {
+        pc = ensurePeer(from, false);
+      }
+
+      try {
+        if (pc.signalingState !== "stable" && pc.signalingState !== "have-remote-offer") {
+          // Ignore glare while we aren't the sharer.
+          if (pc.signalingState === "have-local-offer") return;
+        }
+        await pc.setRemoteDescription(sdp);
+        await flushIce(pc, from, iceQueueRef.current);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("webrtc-answer", { to: from, sdp: pc.localDescription });
+        setLinkState("Answering screen…");
+      } catch {
+        closePeer(from);
+        socket.emit("request-screen");
+      }
     };
 
     const onAnswer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       const pc = peersRef.current.get(from);
       if (!pc) return;
       if (pc.signalingState !== "have-local-offer") return;
-      await pc.setRemoteDescription(sdp);
-      await flushIce(pc, from, iceQueueRef.current);
-      await tuneOutgoing(pc);
+      try {
+        await pc.setRemoteDescription(sdp);
+        await flushIce(pc, from, iceQueueRef.current);
+        await tuneOutgoing(pc);
+      } catch {
+        /* ignore */
+      }
     };
 
     const onIce = async ({
@@ -345,9 +409,10 @@ export function useScreenWatch({
       from: string;
       candidate: RTCIceCandidateInit;
     }) => {
-      const pc =
-        peersRef.current.get(from) ||
-        ensurePeer(from, sharerRef.current === youId && !!screenRef.current);
+      let pc = peersRef.current.get(from);
+      if (!pc) {
+        pc = ensurePeer(from, sharerRef.current === youId && !!screenRef.current);
+      }
       await addIce(pc, from, candidate, iceQueueRef.current);
     };
 
@@ -381,7 +446,8 @@ export function useScreenWatch({
   return {
     stageStream,
     isSharing: screenSharerId === youId && !!localScreen,
-    error,
+    error: error || (linkState && !remoteScreen && screenSharerId && screenSharerId !== youId ? linkState : ""),
+    status: linkState,
     startShare,
     stopShare,
   };

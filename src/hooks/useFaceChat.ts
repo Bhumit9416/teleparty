@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
 import type { Member } from "../types";
-import { ICE, addIce, flushIce, type IceQueue } from "../lib/rtc";
+import { ICE, addIce, flushIce, isPcDead, type IceQueue } from "../lib/rtc";
 
 export type FacePeer = {
   id: string;
@@ -25,6 +25,8 @@ export function useFaceChat({ socket, youId, members }: Options) {
   const [error, setError] = useState("");
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const makingOfferRef = useRef<Set<string>>(new Set());
+  const ignoreOfferRef = useRef<Set<string>>(new Set());
   const localRef = useRef<MediaStream | null>(null);
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const iceQueueRef = useRef<IceQueue>(new Map());
@@ -61,7 +63,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
   const syncSenders = useCallback(async (pc: RTCPeerConnection, stream: MediaStream | null) => {
     for (const kind of ["audio", "video"] as const) {
       const track = stream?.getTracks().find((t) => t.kind === kind) || null;
-      const sender = pc.getSenders().find((s) => s.track?.kind === kind);
+      let sender = pc.getSenders().find((s) => s.track?.kind === kind);
       if (!sender && track && stream) {
         pc.addTrack(track, stream);
       } else if (sender) {
@@ -73,9 +75,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
   const ensurePeer = useCallback(
     (peerId: string) => {
       let pc = peersRef.current.get(peerId);
-      if (pc && pc.connectionState !== "failed" && pc.connectionState !== "closed") {
-        return pc;
-      }
+      if (pc && !isPcDead(pc)) return pc;
       if (pc) {
         pc.close();
         peersRef.current.delete(peerId);
@@ -98,13 +98,12 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
       pc.ontrack = (ev) => {
         let stream = remoteStreamsRef.current.get(peerId);
-        if (ev.streams[0]) {
-          stream = ev.streams[0];
-        } else {
-          stream = stream ?? new MediaStream();
-          if (!stream.getTrackById(ev.track.id)) stream.addTrack(ev.track);
+        if (!stream) {
+          stream = ev.streams[0] ? new MediaStream(ev.streams[0].getTracks()) : new MediaStream();
         }
-        upsertRemote(peerId, stream);
+        if (!stream.getTrackById(ev.track.id)) stream.addTrack(ev.track);
+        const next = new MediaStream(stream.getTracks());
+        upsertRemote(peerId, next);
       };
 
       pc.onconnectionstatechange = () => {
@@ -112,6 +111,9 @@ export function useFaceChat({ socket, youId, members }: Options) {
           pc.close();
           peersRef.current.delete(peerId);
           removeRemote(peerId);
+          if (localRef.current) {
+            window.setTimeout(() => void offerToRef.current(peerId), 700);
+          }
         }
       };
 
@@ -120,35 +122,51 @@ export function useFaceChat({ socket, youId, members }: Options) {
     [removeRemote, socket, upsertRemote],
   );
 
+  const offerToRef = useRef<(peerId: string) => Promise<void>>(async () => {});
+
   const offerTo = useCallback(
     async (peerId: string) => {
-      if (peerId === youRef.current) return;
-      // Only the peer with the lower id initiates when both may offer (reduces glare).
-      // But if only we have media, we must offer.
-      const pc = ensurePeer(peerId);
-      if (localRef.current) await syncSenders(pc, localRef.current);
+      if (peerId === youRef.current || !localRef.current) return;
+      if (makingOfferRef.current.has(peerId)) return;
 
+      // Perfect negotiation: only the "impolite" (lower id) side creates offers when both may.
+      // If the other side has no connection yet, we still offer so they can see us.
+      const pcExisting = peersRef.current.get(peerId);
+      const mustOffer = !pcExisting || isPcDead(pcExisting);
+      const impolite = youRef.current < peerId;
+      if (!mustOffer && !impolite && pcExisting?.connectionState === "connected") return;
+
+      const pc = ensurePeer(peerId);
       if (pc.signalingState !== "stable") return;
 
+      makingOfferRef.current.add(peerId);
       try {
+        await syncSenders(pc, localRef.current);
         const offer = await pc.createOffer();
+        if (pc.signalingState !== "stable") return;
         await pc.setLocalDescription(offer);
-        socket.emit("cam-offer", { to: peerId, sdp: pc.localDescription || offer });
+        socket.emit("cam-offer", { to: peerId, sdp: pc.localDescription });
       } catch {
         /* ignore */
+      } finally {
+        makingOfferRef.current.delete(peerId);
       }
     },
     [ensurePeer, socket, syncSenders],
   );
 
-  const connectAll = useCallback(async () => {
+  useEffect(() => {
+    offerToRef.current = offerTo;
+  }, [offerTo]);
+
+  const connectMissing = useCallback(() => {
+    if (!localRef.current) return;
     for (const m of membersRef.current) {
       if (m.id === youRef.current) continue;
-      // Lower id offers toward higher id to avoid glare; media holder always offers if other has no pc.
-      const shouldOffer =
-        !!localRef.current &&
-        (youRef.current < m.id || !peersRef.current.has(m.id));
-      if (shouldOffer) await offerTo(m.id);
+      const pc = peersRef.current.get(m.id);
+      if (!pc || isPcDead(pc) || pc.connectionState === "disconnected") {
+        void offerTo(m.id);
+      }
     }
   }, [offerTo]);
 
@@ -161,14 +179,15 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
       if (stream) {
         socket.emit("cam-ready");
-        await connectAll();
+        window.setTimeout(() => connectMissing(), 300);
+        window.setTimeout(() => connectMissing(), 1200);
       } else {
         for (const pc of peersRef.current.values()) {
           await syncSenders(pc, null);
         }
       }
     },
-    [connectAll, socket, syncSenders],
+    [connectMissing, socket, syncSenders],
   );
 
   const startCamera = useCallback(async () => {
@@ -217,18 +236,18 @@ export function useFaceChat({ socket, youId, members }: Options) {
     setCamOn(next);
   }, [startCamera]);
 
-  // When people join/leave, reconnect cameras.
   useEffect(() => {
-    if (!localRef.current) return;
-    const t = window.setTimeout(() => void connectAll(), 350);
+    if (!localStream) return;
+    const t = window.setTimeout(() => connectMissing(), 400);
     return () => window.clearTimeout(t);
-  }, [members, connectAll]);
+  }, [members, localStream, connectMissing]);
 
   useEffect(() => {
     const onJoined = (member: Member) => {
       if (member.id === youId) return;
       if (localRef.current) {
-        window.setTimeout(() => void offerTo(member.id), 350);
+        window.setTimeout(() => void offerTo(member.id), 400);
+        window.setTimeout(() => void offerTo(member.id), 1400);
       }
     };
 
@@ -236,41 +255,55 @@ export function useFaceChat({ socket, youId, members }: Options) {
       peersRef.current.get(id)?.close();
       peersRef.current.delete(id);
       iceQueueRef.current.delete(id);
+      makingOfferRef.current.delete(id);
       removeRemote(id);
     };
 
     const onReady = ({ from }: { from: string }) => {
       if (from === youId) return;
-      // Peer announced a camera — offer if we also have one, or just be ready to answer.
       if (localRef.current) {
-        window.setTimeout(() => void offerTo(from), 200);
+        window.setTimeout(() => void offerTo(from), 300);
       }
     };
 
     const onOffer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       const pc = ensurePeer(from);
       const polite = youId > from;
-      if (pc.signalingState !== "stable") {
-        if (!polite) return;
+      const offering = makingOfferRef.current.has(from) || pc.signalingState !== "stable";
+
+      if (offering) {
+        if (!polite) {
+          ignoreOfferRef.current.add(from);
+          return;
+        }
         try {
           await pc.setLocalDescription({ type: "rollback" });
         } catch {
           /* ignore */
         }
       }
-      await pc.setRemoteDescription(sdp);
-      await flushIce(pc, from, iceQueueRef.current);
-      if (localRef.current) await syncSenders(pc, localRef.current);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit("cam-answer", { to: from, sdp: pc.localDescription || answer });
+
+      try {
+        await pc.setRemoteDescription(sdp);
+        await flushIce(pc, from, iceQueueRef.current);
+        if (localRef.current) await syncSenders(pc, localRef.current);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("cam-answer", { to: from, sdp: pc.localDescription });
+      } catch {
+        /* ignore */
+      }
     };
 
     const onAnswer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       const pc = peersRef.current.get(from);
       if (!pc || pc.signalingState !== "have-local-offer") return;
-      await pc.setRemoteDescription(sdp);
-      await flushIce(pc, from, iceQueueRef.current);
+      try {
+        await pc.setRemoteDescription(sdp);
+        await flushIce(pc, from, iceQueueRef.current);
+      } catch {
+        /* ignore */
+      }
     };
 
     const onIce = async ({

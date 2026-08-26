@@ -226,6 +226,7 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
                 </button>
                 <span className="cinema-controls__live">
                   Live{sharer ? ` · ${sharer.name}` : ""}
+                  {screen.status ? ` · ${screen.status}` : ""}
                 </span>
                 {(screen.isSharing || room.playback.screenSharerId === you.id) && (
                   <button
@@ -241,6 +242,7 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
                 </button>
               </div>
             )}
+            {cinema && screen.error && <p className="call__error">{screen.error}</p>}
 
             <VideoStage
               playback={room.playback}
