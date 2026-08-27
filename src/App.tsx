@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { Lobby } from "./components/Lobby";
 import { Room } from "./components/Room";
+import { ensureIce, iceHasTurn } from "./lib/rtc";
 import type { Member, RoomState } from "./types";
 
 const SOCKET_URL =
@@ -14,8 +15,10 @@ export default function App() {
   const [room, setRoom] = useState<RoomState | null>(null);
   const [error, setError] = useState("");
   const [connecting, setConnecting] = useState(false);
+  const [hasTurn, setHasTurn] = useState(true);
 
   useEffect(() => {
+    void ensureIce(SOCKET_URL).then(() => setHasTurn(iceHasTurn()));
     const s = io(SOCKET_URL, {
       autoConnect: true,
       transports: ["websocket", "polling"],
@@ -85,6 +88,7 @@ export default function App() {
         you={you}
         isHost={isHost}
         onLeave={leaveRoom}
+        hasTurn={hasTurn}
       />
     );
   }

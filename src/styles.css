@@ -216,6 +216,28 @@ button {
     var(--bg);
 }
 
+.room__turn-hint,
+.room__cinema-status {
+  margin: 0;
+  padding: 0.45rem 1rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  background: rgba(0, 0, 0, 0.35);
+  text-align: center;
+  z-index: 5;
+}
+
+.room__cinema-status {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 .room__bar {
   position: relative;
   z-index: 3;

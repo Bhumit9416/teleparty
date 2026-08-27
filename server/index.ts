@@ -1,4 +1,5 @@
 import cors from "cors";
+import { createHmac } from "crypto";
 import express from "express";
 import { existsSync } from "fs";
 import { createServer } from "http";
@@ -347,8 +348,105 @@ io.on("connection", (socket) => {
   });
 });
 
+type IceServer = {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+};
+
+let iceCache: { servers: IceServer[]; at: number } | null = null;
+
+/** coturn-style temporary username/password from a static auth secret. */
+function turnCredsFromSecret(secret: string, ttlSec = 24 * 3600) {
+  const expiry = Math.floor(Date.now() / 1000) + ttlSec;
+  const username = `${expiry}:teleparty`;
+  const credential = createHmac("sha1", secret).update(username).digest("base64");
+  return { username, credential };
+}
+
+async function resolveIceServers(): Promise<{ iceServers: IceServer[]; hasTurn: boolean }> {
+  if (iceCache && Date.now() - iceCache.at < 45 * 60 * 1000) {
+    const hasTurn = iceCache.servers.some((s) =>
+      (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => String(u).startsWith("turn")),
+    );
+    return { iceServers: iceCache.servers, hasTurn };
+  }
+
+  const iceServers: IceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ];
+
+  const meteredKey = process.env.METERED_TURN_API_KEY?.trim();
+  const meteredDomain = process.env.METERED_DOMAIN?.trim();
+  if (meteredKey && meteredDomain) {
+    try {
+      const url = `https://${meteredDomain.replace(/^https?:\/\//, "")}/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = (await res.json()) as IceServer[];
+        if (Array.isArray(data)) iceServers.push(...data);
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  const turnUrls = process.env.TURN_URLS?.split(",")
+    .map((u) => u.trim())
+    .filter(Boolean);
+  if (turnUrls?.length && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    iceServers.push({
+      urls: turnUrls,
+      username: process.env.TURN_USERNAME,
+      credential: process.env.TURN_CREDENTIAL,
+    });
+  }
+
+  // Free Open Relay static-auth TURN (works across different Wi‑Fi / mobile).
+  // Prefer custom Metered/TURN_* above when set.
+  const alreadyHasTurn = iceServers.some((s) =>
+    (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => String(u).startsWith("turn")),
+  );
+  if (!alreadyHasTurn) {
+    const secret = process.env.TURN_STATIC_SECRET?.trim() || "openrelayprojectsecret";
+    const { username, credential } = turnCredsFromSecret(secret);
+    iceServers.push({
+      urls: [
+        "turn:staticauth.openrelay.metered.ca:80",
+        "turn:staticauth.openrelay.metered.ca:443",
+        "turn:staticauth.openrelay.metered.ca:443?transport=tcp",
+        "turns:staticauth.openrelay.metered.ca:443",
+      ],
+      username,
+      credential,
+    });
+  }
+
+  iceCache = { servers: iceServers, at: Date.now() };
+  const hasTurn = iceServers.some((s) =>
+    (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => String(u).startsWith("turn")),
+  );
+  return { iceServers, hasTurn };
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, rooms: rooms.size });
+});
+
+app.get("/api/ice", async (_req, res) => {
+  try {
+    const payload = await resolveIceServers();
+    res.json(payload);
+  } catch {
+    res.json({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+      ],
+      hasTurn: false,
+    });
+  }
 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -357,7 +455,11 @@ const distPath = path.join(__dirname, "..", "dist");
 if (existsSync(distPath)) {
   app.use(express.static(distPath));
   app.get("*", (req, res, next) => {
-    if (req.path.startsWith("/socket.io") || req.path.startsWith("/health")) {
+    if (
+      req.path.startsWith("/socket.io") ||
+      req.path.startsWith("/health") ||
+      req.path.startsWith("/api/")
+    ) {
       next();
       return;
     }

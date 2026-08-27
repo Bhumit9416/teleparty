@@ -5,9 +5,8 @@ Watch videos together with synced playback, live screen share, cameras, chat, an
 ## Links
 
 - **GitHub:** https://github.com/Bhumit9416/teleparty
-- **Vercel (UI):** https://teleparty-virid.vercel.app
-
-> Rooms, chat, cams, and screen share need a always-on Node server (WebSockets). Vercel hosts the UI; for a **fully working** public app, deploy the same repo on [Render](https://render.com/deploy?repo=https://github.com/Bhumit9416/teleparty) (free web service), then either use that URL directly or set `VITE_SOCKET_URL` on Vercel to your Render URL and redeploy.
+- **Live app (use this):** https://teleparty-r3qc.onrender.com/
+- **Vercel (UI only):** https://teleparty-virid.vercel.app — rooms/cams/screen need the Render URL above
 
 ## Local
 
@@ -21,14 +20,26 @@ npm run dev
 
 ## How to use
 
-1. One person creates a room and shares the 6-character code.
-2. Choose **Video link** (host pastes a direct `.mp4` / `.webm` URL) **or** **Share screen** (anyone shares a window/display into the main player).
-3. Play stays in sync for links; for screen share, everyone sees the live screen in the same stage.
-4. Chat and reactions work either way.
-5. Optionally use **Cameras** under the player so everyone can see faces and talk while watching.
+1. Both of you open the **Render** link (not Vercel alone).
+2. One creates a room and shares the 6-character code.
+3. Choose **Video link** (host pastes a direct `.mp4` / `.webm` URL) **or** **Share screen**.
+4. For screen share: share the **tab/window you’re watching** (not the Teleparty tab), and turn on **Share tab audio** if you want sound.
+5. Both tap **Turn on camera** under Together so faces appear.
+6. Hard-refresh (Ctrl+Shift+R) after a deploy if something still says “Connecting…”.
+
+## If screen/cams stay on “Connecting…”
+
+WebRTC needs a **TURN** relay when you’re on different Wi‑Fi or mobile data. The server includes Open Relay static-auth TURN by default. For a more reliable free TURN:
+
+1. Sign up at [Metered Open Relay](https://www.metered.ca/tools/openrelay/) and create an app.
+2. On Render → Environment, set:
+   - `METERED_DOMAIN` = `your-app-name.metered.live`
+   - `METERED_TURN_API_KEY` = your API key  
+   Or set `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` from any TURN provider.
+3. Redeploy, then both hard-refresh and restart share/cameras.
+
+Same Wi‑Fi usually works even without TURN.
 
 ## Sample video URL for testing
-
-Big Buck Bunny (open movie):
 
 `https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4`

@@ -23,9 +23,10 @@ type Props = {
   you: Member;
   isHost: boolean;
   onLeave: () => void;
+  hasTurn?: boolean;
 };
 
-export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
+export function Room({ socket, room, setRoom, you, isHost, onLeave, hasTurn = true }: Props) {
   const [reactions, setReactions] = useState<FloatingReaction[]>([]);
   const [copied, setCopied] = useState(false);
   const [videoDraft, setVideoDraft] = useState(room.playback.videoUrl);
@@ -149,6 +150,19 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave }: Props) {
             Leave
           </button>
         </header>
+      )}
+
+      {!hasTurn && !cinema && (
+        <p className="room__turn-hint" role="status">
+          Screen &amp; cameras work best on the same Wi‑Fi. Across networks, set a TURN server on Render
+          (see README).
+        </p>
+      )}
+
+      {(screen.error || screen.status) && cinema && (
+        <p className="room__cinema-status" role="status">
+          {screen.error || screen.status}
+        </p>
       )}
 
       <main className="room__main">

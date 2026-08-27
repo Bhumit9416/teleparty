@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
 import type { Member } from "../types";
 import {
-  ICE,
   addIce,
+  ensureIce,
   flushIce,
+  getIce,
   isPcDead,
   shouldRenegotiate,
   type IceQueue,
@@ -86,7 +87,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
         peersRef.current.delete(peerId);
       }
 
-      pc = new RTCPeerConnection(ICE);
+      pc = new RTCPeerConnection(getIce());
       peersRef.current.set(peerId, pc);
       offerStartedRef.current.set(peerId, Date.now());
 
@@ -115,7 +116,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+        if (pc.connectionState === "failed") {
           peersRef.current.delete(peerId);
           pc.close();
           removeRemote(peerId);
@@ -205,6 +206,10 @@ export function useFaceChat({ socket, youId, members }: Options) {
   const startCamera = useCallback(async () => {
     setError("");
     try {
+      await ensureIce(
+        import.meta.env.VITE_SOCKET_URL ||
+          (import.meta.env.DEV ? "http://localhost:3001" : window.location.origin),
+      );
       const cam = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user" },
         audio: true,

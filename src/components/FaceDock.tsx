@@ -35,10 +35,32 @@ function FaceTile({
     if (el.srcObject !== stream) {
       el.srcObject = stream;
     }
-    if (stream) {
-      el.play().catch(() => {});
-    }
-  }, [stream]);
+    if (!stream) return;
+
+    const tryPlay = () => {
+      el.play().catch(() => {
+        // Autoplay with sound can fail — mute briefly then unmute after play.
+        if (!muted) {
+          el.muted = true;
+          el.play()
+            .then(() => {
+              el.muted = false;
+            })
+            .catch(() => {});
+        }
+      });
+    };
+
+    tryPlay();
+    stream.getTracks().forEach((t) => {
+      t.addEventListener("unmute", tryPlay);
+    });
+    return () => {
+      stream.getTracks().forEach((t) => {
+        t.removeEventListener("unmute", tryPlay);
+      });
+    };
+  }, [stream, muted]);
 
   return (
     <figure className={`face-tile ${stream ? "" : "is-empty"}`}>

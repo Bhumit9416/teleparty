@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
 import type { Member } from "../types";
 import {
-  ICE,
   addIce,
+  ensureIce,
   flushIce,
+  getIce,
   isPcDead,
   shouldRenegotiate,
   type IceQueue,
@@ -116,7 +117,7 @@ export function useScreenWatch({
         peersRef.current.delete(peerId);
       }
 
-      pc = new RTCPeerConnection(ICE);
+      pc = new RTCPeerConnection(getIce());
       peersRef.current.set(peerId, pc);
       offerStartedRef.current.set(peerId, Date.now());
 
@@ -154,7 +155,8 @@ export function useScreenWatch({
           setLinkState("Screen connected");
           offerStartedRef.current.set(peerId, Date.now());
         }
-        if (state === "failed" || state === "disconnected") {
+        // Only hard-reset on failed — "disconnected" is often brief and recovers.
+        if (state === "failed") {
           setLinkState("Screen reconnecting…");
           closePeer(peerId);
           window.setTimeout(() => {
@@ -231,6 +233,11 @@ export function useScreenWatch({
     setError("");
     setLinkState("Starting share…");
     try {
+      await ensureIce(
+        import.meta.env.VITE_SOCKET_URL ||
+          (import.meta.env.DEV ? "http://localhost:3001" : window.location.origin),
+      );
+
       let screen: MediaStream;
       try {
         screen = await navigator.mediaDevices.getDisplayMedia({
