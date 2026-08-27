@@ -7,7 +7,6 @@ import {
   flushIce,
   getIce,
   isPcDead,
-  shouldRenegotiate,
   type IceQueue,
 } from "../lib/rtc";
 
@@ -24,6 +23,10 @@ type Options = {
   members: Member[];
 };
 
+const ICE_BASE =
+  import.meta.env.VITE_SOCKET_URL ||
+  (import.meta.env.DEV ? "http://localhost:3001" : window.location.origin);
+
 export function useFaceChat({ socket, youId, members }: Options) {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remotes, setRemotes] = useState<FacePeer[]>([]);
@@ -32,14 +35,17 @@ export function useFaceChat({ socket, youId, members }: Options) {
   const [error, setError] = useState("");
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const offerStartedRef = useRef<Map<string, number>>(new Map());
   const makingOfferRef = useRef<Set<string>>(new Set());
   const localRef = useRef<MediaStream | null>(null);
-  const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const remoteRtcRef = useRef<Map<string, MediaStream>>(new Map());
   const iceQueueRef = useRef<IceQueue>(new Map());
   const membersRef = useRef(members);
   const youRef = useRef(youId);
-  const offerToRef = useRef<(peerId: string, force?: boolean) => Promise<void>>(async () => {});
+  const offerToRef = useRef<(peerId: string) => Promise<void>>(async () => {});
+  const relayTimerRef = useRef<number | null>(null);
+  const fallbackCanvasRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const fallbackStreamRef = useRef<Map<string, MediaStream>>(new Map());
+  const webrtcOkRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     membersRef.current = members;
@@ -48,24 +54,99 @@ export function useFaceChat({ socket, youId, members }: Options) {
     youRef.current = youId;
   }, [youId]);
 
-  const upsertRemote = useCallback((id: string, stream: MediaStream) => {
+  const memberMeta = useCallback((id: string) => {
     const member = membersRef.current.find((m) => m.id === id);
-    remoteStreamsRef.current.set(id, stream);
-    setRemotes((list) => [
-      ...list.filter((r) => r.id !== id),
-      {
-        id,
-        stream,
-        name: member?.name || "Guest",
-        color: member?.color || "#e8a54b",
-      },
-    ]);
+    return {
+      name: member?.name || "Guest",
+      color: member?.color || "#e8a54b",
+    };
   }, []);
 
+  const publishRemote = useCallback(
+    (id: string, stream: MediaStream) => {
+      const meta = memberMeta(id);
+      setRemotes((list) => [
+        ...list.filter((r) => r.id !== id),
+        { id, stream, name: meta.name, color: meta.color },
+      ]);
+    },
+    [memberMeta],
+  );
+
+  const preferRemote = useCallback(
+    (id: string) => {
+      if (webrtcOkRef.current.has(id)) {
+        const rtc = remoteRtcRef.current.get(id);
+        if (rtc?.getVideoTracks().some((t) => t.readyState === "live")) {
+          publishRemote(id, rtc);
+          return;
+        }
+      }
+      const fallback = fallbackStreamRef.current.get(id);
+      if (fallback) publishRemote(id, fallback);
+    },
+    [publishRemote],
+  );
+
   const removeRemote = useCallback((id: string) => {
-    remoteStreamsRef.current.delete(id);
+    remoteRtcRef.current.delete(id);
+    fallbackStreamRef.current.delete(id);
+    fallbackCanvasRef.current.delete(id);
+    webrtcOkRef.current.delete(id);
     setRemotes((list) => list.filter((r) => r.id !== id));
   }, []);
+
+  const ensureFallback = useCallback((id: string) => {
+    if (fallbackCanvasRef.current.has(id) && fallbackStreamRef.current.has(id)) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 240;
+    const stream = canvas.captureStream(6);
+    fallbackCanvasRef.current.set(id, canvas);
+    fallbackStreamRef.current.set(id, stream);
+  }, []);
+
+  const stopRelay = useCallback(() => {
+    if (relayTimerRef.current) {
+      window.clearInterval(relayTimerRef.current);
+      relayTimerRef.current = null;
+    }
+  }, []);
+
+  const startRelay = useCallback(
+    (stream: MediaStream) => {
+      stopRelay();
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      void video.play().catch(() => {});
+
+      relayTimerRef.current = window.setInterval(() => {
+        if (!localRef.current) return;
+        if (!video.videoWidth) return;
+        const w = 320;
+        const h = Math.max(2, Math.round((video.videoHeight / video.videoWidth) * w));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(video, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => {
+            if (!blob || blob.size > 120_000) return;
+            void blob.arrayBuffer().then((buf) => {
+              socket.volatile.emit("cam-frame", buf);
+            });
+          },
+          "image/jpeg",
+          0.5,
+        );
+      }, 220);
+    },
+    [socket, stopRelay],
+  );
 
   const syncSenders = useCallback(async (pc: RTCPeerConnection, stream: MediaStream | null) => {
     for (const kind of ["audio", "video"] as const) {
@@ -77,11 +158,10 @@ export function useFaceChat({ socket, youId, members }: Options) {
   }, []);
 
   const ensurePeer = useCallback(
-    (peerId: string) => {
+    async (peerId: string) => {
+      await ensureIce(ICE_BASE);
       let pc = peersRef.current.get(peerId);
-      if (pc && !isPcDead(pc) && !shouldRenegotiate(pc, offerStartedRef.current.get(peerId))) {
-        return pc;
-      }
+      if (pc && !isPcDead(pc)) return pc;
       if (pc) {
         pc.close();
         peersRef.current.delete(peerId);
@@ -89,7 +169,6 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
       pc = new RTCPeerConnection(getIce());
       peersRef.current.set(peerId, pc);
-      offerStartedRef.current.set(peerId, Date.now());
 
       if (localRef.current) {
         for (const track of localRef.current.getTracks()) {
@@ -106,59 +185,53 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
       pc.ontrack = (ev) => {
         const inbound = ev.streams[0] || new MediaStream([ev.track]);
-        let stream = remoteStreamsRef.current.get(peerId) ?? new MediaStream();
+        let stream = remoteRtcRef.current.get(peerId) ?? new MediaStream();
         for (const t of inbound.getTracks()) {
           if (!stream.getTrackById(t.id)) stream.addTrack(t);
         }
         if (!stream.getTrackById(ev.track.id)) stream.addTrack(ev.track);
         const next = new MediaStream(stream.getTracks());
-        upsertRemote(peerId, next);
+        remoteRtcRef.current.set(peerId, next);
+        webrtcOkRef.current.add(peerId);
+        preferRemote(peerId);
       };
 
       pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "connected") {
+          webrtcOkRef.current.add(peerId);
+          preferRemote(peerId);
+        }
         if (pc.connectionState === "failed") {
+          webrtcOkRef.current.delete(peerId);
           peersRef.current.delete(peerId);
           pc.close();
-          removeRemote(peerId);
+          preferRemote(peerId);
           if (localRef.current) {
-            window.setTimeout(() => void offerToRef.current(peerId, true), 900);
+            window.setTimeout(() => void offerToRef.current(peerId), 1500);
           }
         }
       };
 
       return pc;
     },
-    [removeRemote, socket, upsertRemote],
+    [preferRemote, socket],
   );
 
   const offerTo = useCallback(
-    async (peerId: string, force = false) => {
+    async (peerId: string) => {
       if (peerId === youRef.current || !localRef.current) return;
       if (makingOfferRef.current.has(peerId)) return;
 
       let pc = peersRef.current.get(peerId);
-      if (!force && pc?.connectionState === "connected") return;
-
-      // Lower socket id initiates when both have cameras (avoids glare).
-      const polite = youRef.current > peerId;
-      if (!force && polite && pc && !isPcDead(pc)) return;
-
-      if (force || shouldRenegotiate(pc, offerStartedRef.current.get(peerId))) {
-        if (pc) {
-          pc.close();
-          peersRef.current.delete(peerId);
-        }
-        pc = ensurePeer(peerId);
-      } else {
-        pc = ensurePeer(peerId);
-        if (pc.signalingState !== "stable") return;
-      }
+      if (pc?.connectionState === "connected") return;
+      if (pc && pc.signalingState !== "stable") return;
 
       makingOfferRef.current.add(peerId);
-      offerStartedRef.current.set(peerId, Date.now());
       try {
+        pc = await ensurePeer(peerId);
         await syncSenders(pc, localRef.current);
-        const offer = await pc.createOffer({ iceRestart: force });
+        if (pc.signalingState !== "stable") return;
+        const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socket.emit("cam-offer", { to: peerId, sdp: pc.localDescription });
       } catch {
@@ -174,16 +247,13 @@ export function useFaceChat({ socket, youId, members }: Options) {
     offerToRef.current = offerTo;
   }, [offerTo]);
 
-  const connectAll = useCallback(
-    (force = false) => {
-      if (!localRef.current) return;
-      for (const m of membersRef.current) {
-        if (m.id === youRef.current) continue;
-        void offerTo(m.id, force);
-      }
-    },
-    [offerTo],
-  );
+  const connectAll = useCallback(() => {
+    if (!localRef.current) return;
+    for (const m of membersRef.current) {
+      if (m.id === youRef.current) continue;
+      void offerTo(m.id);
+    }
+  }, [offerTo]);
 
   const publish = useCallback(
     async (stream: MediaStream | null) => {
@@ -192,26 +262,25 @@ export function useFaceChat({ socket, youId, members }: Options) {
       setCamOn(!!stream?.getVideoTracks().some((t) => t.enabled && t.readyState === "live"));
       setMicOn(!!stream?.getAudioTracks().some((t) => t.enabled && t.readyState === "live"));
 
+      stopRelay();
       if (stream) {
         socket.emit("cam-ready");
-        window.setTimeout(() => connectAll(true), 250);
-        window.setTimeout(() => connectAll(true), 1500);
+        startRelay(stream);
+        window.setTimeout(() => connectAll(), 400);
+        window.setTimeout(() => connectAll(), 3000);
       } else {
         for (const pc of peersRef.current.values()) await syncSenders(pc, null);
       }
     },
-    [connectAll, socket, syncSenders],
+    [connectAll, socket, startRelay, stopRelay, syncSenders],
   );
 
   const startCamera = useCallback(async () => {
     setError("");
     try {
-      await ensureIce(
-        import.meta.env.VITE_SOCKET_URL ||
-          (import.meta.env.DEV ? "http://localhost:3001" : window.location.origin),
-      );
+      await ensureIce(ICE_BASE);
       const cam = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" },
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
         audio: true,
       });
       localRef.current?.getTracks().forEach((t) => t.stop());
@@ -251,42 +320,26 @@ export function useFaceChat({ socket, youId, members }: Options) {
 
   useEffect(() => {
     if (!localStream) return;
-    const t = window.setTimeout(() => connectAll(false), 400);
+    const t = window.setTimeout(() => connectAll(), 500);
     return () => window.clearTimeout(t);
   }, [members, localStream, connectAll]);
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      if (!localRef.current) return;
-      for (const m of membersRef.current) {
-        if (m.id === youRef.current) continue;
-        const pc = peersRef.current.get(m.id);
-        if (shouldRenegotiate(pc, offerStartedRef.current.get(m.id))) {
-          void offerTo(m.id, true);
-        }
-      }
-    }, 6000);
-    return () => window.clearInterval(id);
-  }, [offerTo]);
-
-  useEffect(() => {
     const onJoined = (member: Member) => {
       if (member.id === youId || !localRef.current) return;
-      window.setTimeout(() => void offerTo(member.id, true), 400);
-      window.setTimeout(() => void offerTo(member.id, true), 2000);
+      window.setTimeout(() => void offerTo(member.id), 600);
     };
 
     const onLeft = (id: string) => {
       peersRef.current.get(id)?.close();
       peersRef.current.delete(id);
       iceQueueRef.current.delete(id);
-      offerStartedRef.current.delete(id);
       removeRemote(id);
     };
 
     const onReady = ({ from }: { from: string }) => {
       if (from === youId || !localRef.current) return;
-      window.setTimeout(() => void offerTo(from, true), 300);
+      window.setTimeout(() => void offerTo(from), 400);
     };
 
     const onOffer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
@@ -302,13 +355,12 @@ export function useFaceChat({ socket, youId, members }: Options) {
         }
       }
 
-      if (!pc || isPcDead(pc)) {
-        if (pc) pc.close();
-        peersRef.current.delete(from);
-        pc = ensurePeer(from);
-      }
-
       try {
+        if (!pc || isPcDead(pc)) {
+          if (pc) pc.close();
+          peersRef.current.delete(from);
+          pc = await ensurePeer(from);
+        }
         if (pc.signalingState === "have-local-offer" && !polite) return;
         await pc.setRemoteDescription(sdp);
         await flushIce(pc, from, iceQueueRef.current);
@@ -339,8 +391,34 @@ export function useFaceChat({ socket, youId, members }: Options) {
       from: string;
       candidate: RTCIceCandidateInit | null;
     }) => {
-      const pc = peersRef.current.get(from) || ensurePeer(from);
+      const pc = peersRef.current.get(from) || (await ensurePeer(from));
       await addIce(pc, from, candidate, iceQueueRef.current);
+    };
+
+    const onFrame = async (payload: { from: string; data: ArrayBuffer | Blob | Buffer }) => {
+      const from = payload?.from;
+      const data = payload?.data;
+      if (!from || from === youRef.current || !data) return;
+
+      ensureFallback(from);
+      const canvas = fallbackCanvasRef.current.get(from);
+      if (!canvas) return;
+      try {
+        const blob =
+          data instanceof Blob
+            ? data
+            : new Blob([data as ArrayBuffer], { type: "image/jpeg" });
+        const bmp = await createImageBitmap(blob);
+        if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+          canvas.width = bmp.width;
+          canvas.height = bmp.height;
+        }
+        canvas.getContext("2d")?.drawImage(bmp, 0, 0);
+        bmp.close();
+        preferRemote(from);
+      } catch {
+        /* ignore */
+      }
     };
 
     socket.on("member-joined", onJoined);
@@ -349,6 +427,7 @@ export function useFaceChat({ socket, youId, members }: Options) {
     socket.on("cam-offer", onOffer);
     socket.on("cam-answer", onAnswer);
     socket.on("cam-ice", onIce);
+    socket.on("cam-frame", onFrame);
 
     return () => {
       socket.off("member-joined", onJoined);
@@ -357,16 +436,27 @@ export function useFaceChat({ socket, youId, members }: Options) {
       socket.off("cam-offer", onOffer);
       socket.off("cam-answer", onAnswer);
       socket.off("cam-ice", onIce);
+      socket.off("cam-frame", onFrame);
     };
-  }, [ensurePeer, offerTo, removeRemote, socket, syncSenders, youId]);
+  }, [
+    ensureFallback,
+    ensurePeer,
+    offerTo,
+    preferRemote,
+    removeRemote,
+    socket,
+    syncSenders,
+    youId,
+  ]);
 
   useEffect(() => {
     return () => {
+      stopRelay();
       for (const pc of peersRef.current.values()) pc.close();
       peersRef.current.clear();
       localRef.current?.getTracks().forEach((t) => t.stop());
     };
-  }, []);
+  }, [stopRelay]);
 
   return {
     localStream,

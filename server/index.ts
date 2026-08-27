@@ -52,6 +52,7 @@ const io = new Server(httpServer, {
   allowEIO3: true,
   pingTimeout: 60000,
   pingInterval: 25000,
+  maxHttpBufferSize: 2e6,
 });
 
 const rooms = new Map<string, Room>();
@@ -318,6 +319,22 @@ io.on("connection", (socket) => {
     const room = rooms.get(joinedCode);
     if (!room?.members.has(to)) return;
     io.to(to).emit("cam-ice", { from: socket.id, candidate: candidate ?? null });
+  });
+
+  /** JPEG screen frames — works when WebRTC/TURN cannot connect. */
+  socket.on("screen-frame", (data: ArrayBuffer | Buffer) => {
+    if (!joinedCode || !data) return;
+    const room = rooms.get(joinedCode);
+    if (!room || room.playback.screenSharerId !== socket.id) return;
+    socket.to(joinedCode).emit("screen-frame", data);
+  });
+
+  /** JPEG camera frames fallback. */
+  socket.on("cam-frame", (data: ArrayBuffer | Buffer) => {
+    if (!joinedCode || !data) return;
+    const room = rooms.get(joinedCode);
+    if (!room?.members.has(socket.id)) return;
+    socket.to(joinedCode).emit("cam-frame", { from: socket.id, data });
   });
 
   socket.on("disconnect", () => {

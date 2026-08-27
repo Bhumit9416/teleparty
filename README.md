@@ -29,16 +29,13 @@ npm run dev
 
 ## If screen/cams stay on “Connecting…”
 
-WebRTC needs a **TURN** relay when you’re on different Wi‑Fi or mobile data. The server includes Open Relay static-auth TURN by default. For a more reliable free TURN:
+The app now relays screen and camera frames through the server when WebRTC cannot connect (different Wi‑Fi / mobile). After a Render deploy, both of you should:
 
-1. Sign up at [Metered Open Relay](https://www.metered.ca/tools/openrelay/) and create an app.
-2. On Render → Environment, set:
-   - `METERED_DOMAIN` = `your-app-name.metered.live`
-   - `METERED_TURN_API_KEY` = your API key  
-   Or set `TURN_URLS`, `TURN_USERNAME`, `TURN_CREDENTIAL` from any TURN provider.
-3. Redeploy, then both hard-refresh and restart share/cameras.
+1. Hard-refresh (Ctrl+Shift+R)
+2. Re-join the room
+3. Share screen again and turn cameras on
 
-Same Wi‑Fi usually works even without TURN.
+Optional: for clearer audio across networks, add Metered TURN on Render (`METERED_DOMAIN` + `METERED_TURN_API_KEY`) — see Metered Open Relay signup.
 
 ## Sample video URL for testing
 
