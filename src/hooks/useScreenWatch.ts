@@ -290,6 +290,7 @@ export function useScreenWatch({
             frameRate: { ideal: 24, max: 30 },
             width: { ideal: 1280, max: 1920 },
             height: { ideal: 720, max: 1080 },
+            displaySurface: "browser",
           },
           audio: {
             channelCount: 2,
@@ -298,13 +299,20 @@ export function useScreenWatch({
             autoGainControl: false,
           },
           systemAudio: "include",
+          // Keep Teleparty itself out of the picker so you don't share this site by mistake.
+          selfBrowserSurface: "exclude",
+          preferCurrentTab: false,
+          surfaceSwitching: "include",
+          monitorTypeSurfaces: "include",
         } as DisplayMediaStreamOptions);
       } catch {
         try {
           screen = await navigator.mediaDevices.getDisplayMedia({
             video: true,
             audio: true,
-          });
+            selfBrowserSurface: "exclude",
+            preferCurrentTab: false,
+          } as DisplayMediaStreamOptions);
         } catch {
           screen = await navigator.mediaDevices.getDisplayMedia({
             video: true,
@@ -313,8 +321,14 @@ export function useScreenWatch({
         }
       }
 
+      const surface = screen.getVideoTracks()[0]?.getSettings?.().displaySurface;
+      if (surface === "browser") {
+        setError("");
+      }
       if (!screen.getAudioTracks().length) {
-        setError("Enable “Share tab audio” in the browser dialog for sound.");
+        setError(
+          "Tip: share the video tab (not Teleparty) and turn on “Share tab audio” for sound.",
+        );
       }
 
       screenRef.current?.getTracks().forEach((t) => t.stop());

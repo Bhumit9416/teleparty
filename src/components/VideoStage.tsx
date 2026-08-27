@@ -94,6 +94,20 @@ export function VideoStage({
   }, [screenStream]);
 
   if (playback.mode === "screen") {
+    // Never mirror the sharer's own capture into this page — if they picked this
+    // Teleparty tab (or a window that includes it), that creates a recursive "website" preview.
+    if (isLocalShare) {
+      return (
+        <div className="stage stage--empty stage--sharing">
+          <p>You’re sharing to the room</p>
+          <p className="stage__hint">
+            Others see the tab or window you picked — not this Teleparty page. Keep that
+            video playing in another tab/window.
+          </p>
+        </div>
+      );
+    }
+
     if (!screenStream) {
       return (
         <div className="stage stage--empty">
@@ -114,7 +128,6 @@ export function VideoStage({
           className="stage__video stage__video--screen"
           autoPlay
           playsInline
-          muted={!!isLocalShare}
         />
       </div>
     );

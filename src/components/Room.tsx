@@ -217,7 +217,9 @@ export function Room({ socket, room, setRoom, you, isHost, onLeave, hasTurn = tr
                 {picker === "screen" && (
                   <div className="screen-actions">
                     <p className="watch-hint">
-                      Share a window or display so the room watches that instead of a link.
+                      In the browser popup, pick the <strong>video tab or window</strong> you want
+                      to watch — not this Teleparty page. Enable <strong>Share tab audio</strong>{" "}
+                      if you want sound.
                     </p>
                     <button
                       type="button"
