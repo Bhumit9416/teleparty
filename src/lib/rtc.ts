@@ -2,21 +2,27 @@ export const ICE: RTCConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun.cloudflare.com:3478" },
-    // Free public TURN (needed when you're on different Wi‑Fi / mobile data)
+    // Public TURN relays (required when users are on different networks)
+    {
+      urls: "turn:numb.viagenie.ca",
+      username: "webrtc@live.com",
+      credential: "muazkh",
+    },
     {
       urls: [
         "turn:openrelay.metered.ca:80",
-        "turn:openrelay.metered.ca:80?transport=tcp",
         "turn:openrelay.metered.ca:443",
         "turn:openrelay.metered.ca:443?transport=tcp",
+        "turns:openrelay.metered.ca:443?transport=tcp",
       ],
       username: "openrelayproject",
       credential: "openrelayproject",
     },
   ],
-  iceCandidatePoolSize: 10,
+  iceCandidatePoolSize: 4,
   iceTransportPolicy: "all",
+  bundlePolicy: "max-bundle",
+  rtcpMuxPolicy: "require",
 };
 
 export type IceQueue = Map<string, RTCIceCandidateInit[]>;
@@ -40,9 +46,10 @@ export async function flushIce(
 export async function addIce(
   pc: RTCPeerConnection,
   peerId: string,
-  candidate: RTCIceCandidateInit,
+  candidate: RTCIceCandidateInit | null,
   queue: IceQueue,
 ) {
+  if (!candidate) return;
   if (!pc.remoteDescription) {
     const list = queue.get(peerId) || [];
     list.push(candidate);
@@ -64,4 +71,15 @@ export function isPcDead(pc: RTCPeerConnection | undefined) {
     pc.iceConnectionState === "failed" ||
     pc.iceConnectionState === "closed"
   );
+}
+
+/** True if we should tear down and renegotiate (stuck connecting / disconnected). */
+export function shouldRenegotiate(pc: RTCPeerConnection | undefined, startedAt?: number) {
+  if (!pc) return true;
+  if (isPcDead(pc)) return true;
+  if (pc.connectionState === "disconnected") return true;
+  if (pc.connectionState === "connecting" && startedAt && Date.now() - startedAt > 10000) {
+    return true;
+  }
+  return false;
 }

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Socket } from "socket.io-client";
 import type { Member } from "../types";
-import { ICE, addIce, flushIce, isPcDead, type IceQueue } from "../lib/rtc";
+import {
+  ICE,
+  addIce,
+  flushIce,
+  isPcDead,
+  shouldRenegotiate,
+  type IceQueue,
+} from "../lib/rtc";
 
 type Options = {
   socket: Socket;
@@ -18,12 +25,12 @@ async function tuneOutgoing(pc: RTCPeerConnection) {
     if (!params.encodings?.length) params.encodings = [{}];
 
     if (sender.track.kind === "video") {
-      params.encodings[0].maxBitrate = 5_500_000;
+      params.encodings[0].maxBitrate = 4_000_000;
       params.encodings[0].maxFramerate = 30;
       params.encodings[0].scaleResolutionDownBy = 1;
-      params.degradationPreference = "maintain-resolution";
+      params.degradationPreference = "maintain-framerate";
     } else if (sender.track.kind === "audio") {
-      params.encodings[0].maxBitrate = 256_000;
+      params.encodings[0].maxBitrate = 192_000;
     }
 
     try {
@@ -37,7 +44,6 @@ async function tuneOutgoing(pc: RTCPeerConnection) {
 async function prepareScreenStream(screen: MediaStream) {
   const video = screen.getVideoTracks()[0];
   const audio = screen.getAudioTracks()[0];
-
   if (video) {
     video.contentHint = "motion";
     try {
@@ -47,23 +53,13 @@ async function prepareScreenStream(screen: MediaStream) {
         frameRate: { ideal: 30, max: 30 },
       });
     } catch {
-      try {
-        await video.applyConstraints({
-          width: { ideal: 1600, max: 1920 },
-          height: { ideal: 900, max: 1080 },
-          frameRate: { ideal: 30, max: 30 },
-        });
-      } catch {
-        /* keep capture defaults */
-      }
+      /* keep capture defaults */
     }
   }
-
   if (audio) audio.contentHint = "music";
   return screen;
 }
 
-/** Pushes one person's screen into the main watch stage for everyone else. */
 export function useScreenWatch({
   socket,
   youId,
@@ -77,6 +73,7 @@ export function useScreenWatch({
   const [linkState, setLinkState] = useState("");
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const offerStartedRef = useRef<Map<string, number>>(new Map());
   const makingOfferRef = useRef<Set<string>>(new Set());
   const screenRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
@@ -84,15 +81,14 @@ export function useScreenWatch({
   const membersRef = useRef(members);
   const sharerRef = useRef(screenSharerId);
   const youRef = useRef(youId);
+  const offerToRef = useRef<(peerId: string, force?: boolean) => Promise<void>>(async () => {});
 
   useEffect(() => {
     membersRef.current = members;
   }, [members]);
-
   useEffect(() => {
     sharerRef.current = screenSharerId;
   }, [screenSharerId]);
-
   useEffect(() => {
     youRef.current = youId;
   }, [youId]);
@@ -102,6 +98,7 @@ export function useScreenWatch({
     peersRef.current.delete(id);
     iceQueueRef.current.delete(id);
     makingOfferRef.current.delete(id);
+    offerStartedRef.current.delete(id);
   }, []);
 
   const closeAll = useCallback(() => {
@@ -111,7 +108,9 @@ export function useScreenWatch({
   const ensurePeer = useCallback(
     (peerId: string, asSharer: boolean) => {
       let pc = peersRef.current.get(peerId);
-      if (pc && !isPcDead(pc)) return pc;
+      if (pc && !isPcDead(pc) && !shouldRenegotiate(pc, offerStartedRef.current.get(peerId))) {
+        return pc;
+      }
       if (pc) {
         pc.close();
         peersRef.current.delete(peerId);
@@ -119,33 +118,30 @@ export function useScreenWatch({
 
       pc = new RTCPeerConnection(ICE);
       peersRef.current.set(peerId, pc);
+      offerStartedRef.current.set(peerId, Date.now());
 
       if (asSharer && screenRef.current) {
         for (const track of screenRef.current.getTracks()) {
           pc.addTrack(track, screenRef.current);
         }
-        void tuneOutgoing(pc);
       }
 
       pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
-          socket.emit("webrtc-ice", { to: peerId, candidate: ev.candidate.toJSON() });
-        }
+        socket.emit("webrtc-ice", {
+          to: peerId,
+          candidate: ev.candidate ? ev.candidate.toJSON() : null,
+        });
       };
 
       pc.ontrack = (ev) => {
         if (sharerRef.current === youRef.current) return;
-
-        let stream = remoteStreamRef.current;
-        if (!stream) {
-          stream = ev.streams[0] ? ev.streams[0] : new MediaStream();
-          remoteStreamRef.current = stream;
+        const inbound = ev.streams[0] || new MediaStream([ev.track]);
+        const merged = remoteStreamRef.current ?? new MediaStream();
+        for (const t of inbound.getTracks()) {
+          if (!merged.getTrackById(t.id)) merged.addTrack(t);
         }
-        if (!stream.getTrackById(ev.track.id)) {
-          stream.addTrack(ev.track);
-        }
-        // New MediaStream reference so React refreshes the <video>.
-        const next = new MediaStream(stream.getTracks());
+        if (!merged.getTrackById(ev.track.id)) merged.addTrack(ev.track);
+        const next = new MediaStream(merged.getTracks());
         remoteStreamRef.current = next;
         setRemoteScreen(next);
         setLinkState("Screen connected");
@@ -154,19 +150,21 @@ export function useScreenWatch({
       pc.onconnectionstatechange = () => {
         const state = pc.connectionState;
         if (state === "connecting") setLinkState("Connecting screen…");
-        if (state === "connected") setLinkState("Screen connected");
-        if (state === "failed") {
-          setLinkState("Screen connection failed — retrying…");
-          closePeer(peerId);
-          if (sharerRef.current === youRef.current && screenRef.current) {
-            window.setTimeout(() => {
-              void offerToRef.current(peerId);
-            }, 600);
-          } else if (sharerRef.current && sharerRef.current !== youRef.current) {
-            socket.emit("request-screen");
-          }
+        if (state === "connected") {
+          setLinkState("Screen connected");
+          offerStartedRef.current.set(peerId, Date.now());
         }
-        if (state === "closed") closePeer(peerId);
+        if (state === "failed" || state === "disconnected") {
+          setLinkState("Screen reconnecting…");
+          closePeer(peerId);
+          window.setTimeout(() => {
+            if (sharerRef.current === youRef.current && screenRef.current) {
+              void offerToRef.current(peerId, true);
+            } else if (sharerRef.current && sharerRef.current !== youRef.current) {
+              socket.emit("request-screen");
+            }
+          }, 800);
+        }
       };
 
       return pc;
@@ -174,43 +172,39 @@ export function useScreenWatch({
     [closePeer, socket],
   );
 
-  const offerToRef = useRef<(peerId: string) => Promise<void>>(async () => {});
-
   const offerTo = useCallback(
-    async (peerId: string) => {
+    async (peerId: string, force = false) => {
       if (!screenRef.current || peerId === youRef.current) return;
       if (makingOfferRef.current.has(peerId)) return;
 
       let pc = peersRef.current.get(peerId);
-      if (pc && (pc.connectionState === "connected" || pc.connectionState === "connecting")) {
-        return;
-      }
-      if (pc && pc.signalingState !== "stable") return;
+      if (!force && pc?.connectionState === "connected") return;
 
-      if (isPcDead(pc)) {
+      if (force || shouldRenegotiate(pc, offerStartedRef.current.get(peerId))) {
         if (pc) closePeer(peerId);
         pc = ensurePeer(peerId, true);
       } else if (!pc) {
         pc = ensurePeer(peerId, true);
+      } else if (pc.signalingState !== "stable") {
+        return;
       } else {
-        // Re-attach tracks if needed
-        const senders = pc.getSenders();
         for (const track of screenRef.current.getTracks()) {
-          const has = senders.some((s) => s.track?.id === track.id);
-          if (!has) pc.addTrack(track, screenRef.current);
+          if (!pc.getSenders().some((s) => s.track?.id === track.id)) {
+            pc.addTrack(track, screenRef.current);
+          }
         }
       }
 
       makingOfferRef.current.add(peerId);
+      offerStartedRef.current.set(peerId, Date.now());
       try {
         await tuneOutgoing(pc);
-        const offer = await pc.createOffer();
-        if (pc.signalingState !== "stable") return;
+        const offer = await pc.createOffer({ iceRestart: force });
         await pc.setLocalDescription(offer);
         socket.emit("webrtc-offer", { to: peerId, sdp: pc.localDescription });
         setLinkState("Sending screen…");
       } catch {
-        /* ignore glare */
+        closePeer(peerId);
       } finally {
         makingOfferRef.current.delete(peerId);
       }
@@ -222,18 +216,20 @@ export function useScreenWatch({
     offerToRef.current = offerTo;
   }, [offerTo]);
 
-  const ensureOffersToMembers = useCallback(() => {
-    if (sharerRef.current !== youRef.current || !screenRef.current) return;
-    for (const m of membersRef.current) {
-      if (m.id === youRef.current) continue;
-      const pc = peersRef.current.get(m.id);
-      if (!pc || isPcDead(pc)) void offerTo(m.id);
-    }
-  }, [offerTo]);
+  const pushToEveryone = useCallback(
+    (force = false) => {
+      if (sharerRef.current !== youRef.current || !screenRef.current) return;
+      for (const m of membersRef.current) {
+        if (m.id === youRef.current) continue;
+        void offerTo(m.id, force);
+      }
+    },
+    [offerTo],
+  );
 
   const startShare = useCallback(async () => {
     setError("");
-    setLinkState("");
+    setLinkState("Starting share…");
     try {
       let screen: MediaStream;
       try {
@@ -254,11 +250,7 @@ export function useScreenWatch({
       } catch {
         try {
           screen = await navigator.mediaDevices.getDisplayMedia({
-            video: {
-              frameRate: { ideal: 30, max: 30 },
-              width: { ideal: 1920, max: 1920 },
-              height: { ideal: 1080, max: 1080 },
-            },
+            video: true,
             audio: true,
           });
         } catch {
@@ -270,11 +262,8 @@ export function useScreenWatch({
       }
 
       await prepareScreenStream(screen);
-
       if (!screen.getAudioTracks().length) {
-        setError(
-          "No tab/system audio was shared. In the browser share dialog, enable “Share audio”.",
-        );
+        setError("Enable “Share tab audio” in the browser dialog for sound.");
       }
 
       screenRef.current?.getTracks().forEach((t) => t.stop());
@@ -285,8 +274,9 @@ export function useScreenWatch({
       closeAll();
       socket.emit("start-screen");
 
-      window.setTimeout(() => ensureOffersToMembers(), 400);
-      window.setTimeout(() => ensureOffersToMembers(), 1200);
+      window.setTimeout(() => pushToEveryone(true), 300);
+      window.setTimeout(() => pushToEveryone(true), 1500);
+      window.setTimeout(() => pushToEveryone(false), 4000);
 
       screen.getVideoTracks()[0].onended = () => {
         screenRef.current = null;
@@ -297,8 +287,9 @@ export function useScreenWatch({
       };
     } catch {
       setError("Screen share cancelled or unavailable.");
+      setLinkState("");
     }
-  }, [closeAll, ensureOffersToMembers, socket]);
+  }, [closeAll, pushToEveryone, socket]);
 
   const stopShare = useCallback(() => {
     screenRef.current?.getTracks().forEach((t) => t.stop());
@@ -309,29 +300,44 @@ export function useScreenWatch({
     setLinkState("");
   }, [closeAll, socket]);
 
-  // Sharer: only offer to peers that aren't connected yet (don't tear down live links).
   useEffect(() => {
-    if (!active || screenSharerId !== youId) return;
-    if (!screenRef.current) return;
-    ensureOffersToMembers();
-  }, [active, members, screenSharerId, youId, ensureOffersToMembers]);
+    if (!active || screenSharerId !== youId || !screenRef.current) return;
+    pushToEveryone(false);
+  }, [active, members, screenSharerId, youId, pushToEveryone]);
 
-  // Viewer: keep requesting until we actually have remote tracks.
   useEffect(() => {
     if (!active || !screenSharerId || screenSharerId === youId) return;
-    if (remoteScreen?.getVideoTracks().length) return;
+    if (remoteScreen?.getVideoTracks().some((t) => t.readyState === "live")) return;
 
     setLinkState("Waiting for screen…");
-    socket.emit("request-screen");
-    const timers = [600, 1500, 3000, 5000].map((ms) =>
-      window.setTimeout(() => {
-        if (!remoteStreamRef.current?.getVideoTracks().length) {
-          socket.emit("request-screen");
-        }
-      }, ms),
-    );
+    const ping = () => socket.emit("request-screen");
+    ping();
+    const timers = [800, 2000, 4000, 7000, 11000].map((ms) => window.setTimeout(ping, ms));
     return () => timers.forEach((t) => window.clearTimeout(t));
   }, [active, screenSharerId, youId, remoteScreen, socket, members.length]);
+
+  // Watchdog: if stuck connecting, force renegotiate.
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => {
+      if (sharerRef.current === youRef.current && screenRef.current) {
+        for (const m of membersRef.current) {
+          if (m.id === youRef.current) continue;
+          const pc = peersRef.current.get(m.id);
+          if (shouldRenegotiate(pc, offerStartedRef.current.get(m.id))) {
+            void offerTo(m.id, true);
+          }
+        }
+      } else if (
+        sharerRef.current &&
+        sharerRef.current !== youRef.current &&
+        !remoteStreamRef.current?.getVideoTracks().length
+      ) {
+        socket.emit("request-screen");
+      }
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [active, offerTo, socket]);
 
   useEffect(() => {
     if (!active && screenSharerId !== youId) {
@@ -346,8 +352,8 @@ export function useScreenWatch({
     const onJoined = (member: Member) => {
       if (member.id === youId) return;
       if (sharerRef.current === youId && screenRef.current) {
-        window.setTimeout(() => void offerTo(member.id), 400);
-        window.setTimeout(() => void offerTo(member.id), 1400);
+        window.setTimeout(() => void offerTo(member.id, true), 400);
+        window.setTimeout(() => void offerTo(member.id, true), 2000);
       }
     };
 
@@ -362,32 +368,22 @@ export function useScreenWatch({
 
     const onRequest = ({ from }: { from: string }) => {
       if (sharerRef.current !== youId || !screenRef.current) return;
-      void offerTo(from);
+      void offerTo(from, true);
     };
 
     const onOffer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       if (from === youId) return;
       sharerRef.current = from;
 
-      let pc = peersRef.current.get(from);
-      if (isPcDead(pc)) {
-        if (pc) closePeer(from);
-        pc = ensurePeer(from, false);
-      } else if (!pc) {
-        pc = ensurePeer(from, false);
-      }
-
+      closePeer(from);
+      const pc = ensurePeer(from, false);
       try {
-        if (pc.signalingState !== "stable" && pc.signalingState !== "have-remote-offer") {
-          // Ignore glare while we aren't the sharer.
-          if (pc.signalingState === "have-local-offer") return;
-        }
         await pc.setRemoteDescription(sdp);
         await flushIce(pc, from, iceQueueRef.current);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("webrtc-answer", { to: from, sdp: pc.localDescription });
-        setLinkState("Answering screen…");
+        setLinkState("Connecting screen…");
       } catch {
         closePeer(from);
         socket.emit("request-screen");
@@ -396,14 +392,14 @@ export function useScreenWatch({
 
     const onAnswer = async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       const pc = peersRef.current.get(from);
-      if (!pc) return;
-      if (pc.signalingState !== "have-local-offer") return;
+      if (!pc || pc.signalingState !== "have-local-offer") return;
       try {
         await pc.setRemoteDescription(sdp);
         await flushIce(pc, from, iceQueueRef.current);
         await tuneOutgoing(pc);
       } catch {
-        /* ignore */
+        closePeer(from);
+        void offerTo(from, true);
       }
     };
 
@@ -412,7 +408,7 @@ export function useScreenWatch({
       candidate,
     }: {
       from: string;
-      candidate: RTCIceCandidateInit;
+      candidate: RTCIceCandidateInit | null;
     }) => {
       let pc = peersRef.current.get(from);
       if (!pc) {
@@ -448,10 +444,15 @@ export function useScreenWatch({
   const stageStream =
     screenSharerId === youId ? localScreen : screenSharerId ? remoteScreen : null;
 
+  const waiting =
+    !!screenSharerId &&
+    screenSharerId !== youId &&
+    !remoteScreen?.getVideoTracks().some((t) => t.readyState === "live");
+
   return {
     stageStream,
     isSharing: screenSharerId === youId && !!localScreen,
-    error: error || (linkState && !remoteScreen && screenSharerId && screenSharerId !== youId ? linkState : ""),
+    error: error || (waiting ? linkState || "Waiting for screen…" : ""),
     status: linkState,
     startShare,
     stopShare,

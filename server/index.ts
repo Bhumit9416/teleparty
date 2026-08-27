@@ -46,7 +46,11 @@ app.use(express.json());
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: "*" },
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  transports: ["websocket", "polling"],
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000,
 });
 
 const rooms = new Map<string, Room>();
@@ -288,10 +292,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("webrtc-ice", ({ to, candidate }: { to: string; candidate: unknown }) => {
-    if (!joinedCode || !to || !candidate) return;
+    if (!joinedCode || !to) return;
     const room = rooms.get(joinedCode);
     if (!room?.members.has(to)) return;
-    io.to(to).emit("webrtc-ice", { from: socket.id, candidate });
+    io.to(to).emit("webrtc-ice", { from: socket.id, candidate: candidate ?? null });
   });
 
   socket.on("cam-offer", ({ to, sdp }: { to: string; sdp: unknown }) => {
@@ -309,10 +313,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("cam-ice", ({ to, candidate }: { to: string; candidate: unknown }) => {
-    if (!joinedCode || !to || !candidate) return;
+    if (!joinedCode || !to) return;
     const room = rooms.get(joinedCode);
     if (!room?.members.has(to)) return;
-    io.to(to).emit("cam-ice", { from: socket.id, candidate });
+    io.to(to).emit("cam-ice", { from: socket.id, candidate: candidate ?? null });
   });
 
   socket.on("disconnect", () => {
